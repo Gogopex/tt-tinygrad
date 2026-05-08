@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+tinygrad/
+tt_kernels/
+.DS_Store
+
+tt-lang
+debug_*.py

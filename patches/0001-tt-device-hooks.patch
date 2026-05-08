@@ -1,0 +1,38 @@
+diff --git a/tinygrad/codegen/opt/postrange.py b/tinygrad/codegen/opt/postrange.py
+index e5c0a3f..ac93802 100644
+--- a/tinygrad/codegen/opt/postrange.py
++++ b/tinygrad/codegen/opt/postrange.py
+@@ -344,7 +344,7 @@ def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
+     # beam search may open devices
+     with Context(ALLOW_DEVICE_USAGE=1):
+       k = beam_search(k, rawbufs, beam, bool(getenv("BEAM_ESTIMATE", 1)))
+-  elif not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
++  elif not NOOPT and not ren.disable_hand_coded_opts and (ast.arg is None or ast.arg.applied_opts == ()):
+     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+     # NOTE: hand_coded_optimizations doesn't support multiblock opts yet
+     if not any(u.op is Ops.BUFFERIZE for u in ast.backward_slice):
+diff --git a/tinygrad/device.py b/tinygrad/device.py
+index 1d0b9c9..7d10b73 100644
+--- a/tinygrad/device.py
++++ b/tinygrad/device.py
+@@ -12,7 +12,7 @@ if TYPE_CHECKING: from tinygrad.renderer import Renderer
+ 
+ # **************** Device ****************
+ 
+-ALL_DEVICES = ["METAL", "AMD", "NV", "CUDA", "QCOM", "CL", "CPU", "DSP", "WEBGPU"]
++ALL_DEVICES = ["METAL", "AMD", "NV", "CUDA", "QCOM", "CL", "CPU", "DSP", "WEBGPU", "TT"]
+ class _Device:
+   def __init__(self) -> None:
+     self._devices = [x.stem[len("ops_"):].upper() for x in (pathlib.Path(__file__).parent/"runtime").iterdir() if x.stem.startswith("ops_")]
+diff --git a/tinygrad/renderer/__init__.py b/tinygrad/renderer/__init__.py
+index 044d6b2..05cfa52 100644
+--- a/tinygrad/renderer/__init__.py
++++ b/tinygrad/renderer/__init__.py
+@@ -77,6 +77,7 @@ class Renderer:
+   pre_matcher: PatternMatcher|None = None
+   extra_matcher: PatternMatcher|None = None
+   code_for_op: dict[Ops, Callable] = {}
++  disable_hand_coded_opts: bool = False
+ 
+   compiler: Compiler = Compiler()
+ 
