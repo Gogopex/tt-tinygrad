@@ -5,13 +5,13 @@ Targets [TT-Lang](https://github.com/tenstorrent/tt-lang) (`ttl.math.*`) as the 
 
 Status: PoC. On QuietBox with `tt-lang-dist` 1.0.6 `python tt_tests.py` reports `pass=110 xfail=13 skip=2 fail=0 err=0` over 125 cases (the 2 skips are `matmul_bias` / `layernorm_affine`, which need 1D inputs that the V0 runtime doesn't yet plumb).
 
-## The stack, in one paragraph
+## How it works
 
 `tinygrad` lowers `Tensor.foo()` into a graph of UOps and then asks a per-device `Renderer` to turn each kernel's UOps into source code, which a per-device `Compiled` backend executes. `TT-Lang` is a Python DSL for tile-program kernels: you write functions that consume / produce `ttnn` tile tensors using `ttl.math.*` ops, and `ttl` arranges for them to run on a Tenstorrent card via the `ttnn` runtime. **This repo is the glue**: a `Renderer` that emits TT-Lang Python source for each UOp graph, and a `Compiled` device that parses the rendered kernel's contract, materializes `ttnn` tensors from host buffers, and calls the kernel in-process.
 
-## What this repo adds
+## Files
 
-A three-line patch to upstream tinygrad, plus a small set of Python files:
+A three-line patch to upstream tinygrad, plus:
 
 | File | Role |
 |---|---|
