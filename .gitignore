@@ -6,7 +6,6 @@ venv/
 .env
 
 tinygrad/
-tt_kernels/
 .DS_Store
 
 tt-lang

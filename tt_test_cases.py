@@ -1,33 +1,25 @@
-"""Generate tinygrad TT kernels and stage them for execution on a TT host.
+"""Test cases and torch references for the TT backend.
 
-Renders each test case as its own importable Python file under ./tt_kernels/
-and writes a single driver script that imports and invokes them with ttnn
-tensors. The driver is expected to run inside the tt-lang dist container
-(or any host with ttl + ttnn installed).
+`CASES` is a list of (label, thunk) pairs. Each thunk builds and `.realize()`s a
+tinygrad expression on the "TT" device, using the module-level `tt_input` to
+construct inputs. The runner (`tt_tests.py`) monkey-patches `tt_input` so it
+returns real `from_torch(...)` tensors built from deterministic seeds.
+
+`REFS` is a dict of label -> (torch_fn, in_shapes[, slicer]). Each `in_shapes`
+entry is either a 2D shape `(r, c)` or `ROW64` = `((64,), (1, 64))` indicating a
+1D logical input that's promoted to (1, 64) on device. The V0 in-process runtime
+is 2D only, so the two cases that use `ROW64` (matmul_bias, layernorm_affine)
+are skipped by the runner.
 """
-import os, sys, io, contextlib, pathlib, shutil, re, json
-
-REPO = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(REPO / "tinygrad"))
-os.environ.setdefault("TT_DRYRUN", "1")
-os.environ.setdefault("ALLOW_DEVICE_USAGE", "1")
-
+from __future__ import annotations
+import torch
 from tinygrad import Tensor
-import tinygrad.runtime.ops_tt as ops_tt
 
 def tt_input(*shape, device="TT", dtype=None):
   return Tensor.empty(*shape, device=device, dtype=dtype)
 
-ALLOW_KERNEL_SKIPS = os.environ.get("TT_ALLOW_KERNEL_SKIPS") == "1"
-
-OUT = REPO / "tt_kernels"
-if OUT.exists(): shutil.rmtree(OUT)
-OUT.mkdir()
-
-def capture(thunk):
-  buf = io.StringIO()
-  with contextlib.redirect_stdout(buf): thunk()
-  return buf.getvalue()
+DIM = 64
+ROW64 = ((64,), (1, 64))
 
 CASES = [
   ("add_mul",       lambda: ((tt_input(64, 64, device="TT") + tt_input(64, 64, device="TT")) * 2).realize()),
@@ -318,43 +310,133 @@ CASES = [
         (x + (((qs @ ks.T) * 0.125).softmax(axis=1)).realize() @ vs).realize()))),
 ]
 
-def _skip(name: str, src: str) -> bool:
-  if "NotImplementedError" in src: return True
-  if re.match(r"^E_2(n\d*)?$", name): return True
-  return False
-
-manifest = []
-chain_manifest: dict[str, list[dict]] = {}
-for label, thunk in CASES:
-  ops_tt._dryrun_calls.clear()
-  capture(thunk)
-  calls = list(ops_tt._dryrun_calls)
-  step = 0
-  for call in calls:
-    name, src, buf_ids = call["name"], call["src"], call["buf_ids"]
-    if _skip(name, src):
-      msg = f"{label}: renderer produced unsupported/skipped kernel {name!r}"
-      if not ALLOW_KERNEL_SKIPS: raise RuntimeError(msg)
-      print(f"  skipped {name}: {msg}")
-      continue
-    contract = call.get("contract")
-    if contract is None:
-      raise RuntimeError(f"kernel {name} for {label} missing tt_contract metadata")
-    if contract.get("version") != 1:
-      raise RuntimeError(f"kernel {name} for {label} has unsupported contract version {contract.get('version')!r}")
-    fname = f"{label}__{step:02d}_{name}.py"
-    (OUT / fname).write_text(src)
-    manifest.append((label, name, fname))
-    chain_manifest.setdefault(label, []).append({
-      "file": fname, "fn": name, "buf_ids": buf_ids, **contract,
-    })
-    print(f"  wrote {fname}")
-    step += 1
-  if label not in chain_manifest:
-    raise RuntimeError(f"{label}: no kernels staged")
-
-(OUT / "_manifest.json").write_text(json.dumps(chain_manifest, indent=2))
-print(f"\n{len(manifest)} kernels staged in {OUT}")
-print(f"manifest: {OUT / '_manifest.json'}")
-for label, name, fname in manifest:
-  print(f"  {label:10s} -> {fname}")
+REFS = {
+  "add_mul":         (lambda a, b: (a + b) * 2,                                 [(DIM, DIM), (DIM, DIM)]),
+  "relu":            (lambda a:    torch.relu(a),                               [(DIM, DIM)]),
+  "mul":             (lambda a, b: a * b,                                       [(DIM, DIM), (DIM, DIM)]),
+  "sqrt":            (lambda a:    torch.sqrt(a.clamp(min=0)),                  [(DIM, DIM)]),
+  "sigmoid":         (lambda a:    torch.sigmoid(a),                            [(DIM, DIM)]),
+  "matmul":          (lambda a, b: a @ b,                                       [(DIM, DIM), (DIM, DIM)]),
+  "exp":             (lambda a:    torch.exp(a),                                [(DIM, DIM)]),
+  "abs_diff":        (lambda a, b: (a - b).abs(),                               [(DIM, DIM), (DIM, DIM)]),
+  "matmul_128":      (lambda a, b: a @ b,                                       [(128, 128), (128, 128)]),
+  "matmul_rect":     (lambda a, b: a @ b,                                       [(64, 128), (128, 32)]),
+  "neg":             (lambda a:    -a,                                          [(DIM, DIM)]),
+  "recip":           (lambda a:    1.0 / (a + 1),                               [(DIM, DIM)]),
+  "log":             (lambda a:    torch.log(a + 0.1),                          [(DIM, DIM)]),
+  "tanh":            (lambda a:    torch.tanh(a),                               [(DIM, DIM)]),
+  "matmul_256":      (lambda a, b: a @ b,                                       [(256, 256), (256, 256)]),
+  "matmul_relu":     (lambda a, b: torch.relu(a @ b),                           [(DIM, DIM), (DIM, DIM)]),
+  "matmul_add":      (lambda a, b, c: a @ b + c,                                [(DIM, DIM), (DIM, DIM), (DIM, DIM)]),
+  "gelu":            (lambda a:    torch.nn.functional.gelu(a, approximate="tanh"), [(DIM, DIM)]),
+  "silu":            (lambda a:    torch.nn.functional.silu(a),                 [(DIM, DIM)]),
+  "square":          (lambda a:    a * a,                                       [(DIM, DIM)]),
+  "rsqrt":           (lambda a:    torch.rsqrt(a + 0.1),                        [(DIM, DIM)]),
+  "maximum":         (lambda a, b: torch.maximum(a, b),                         [(DIM, DIM), (DIM, DIM)]),
+  "squared_diff":    (lambda a, b: (a - b) ** 2,                                [(DIM, DIM), (DIM, DIM)]),
+  "matmul_silu":     (lambda a, b: torch.nn.functional.silu(a @ b),             [(DIM, DIM), (DIM, DIM)]),
+  "div":             (lambda a, b: a / (b + 1),                                 [(DIM, DIM), (DIM, DIM)]),
+  "sin":             (lambda a:    torch.sin(a),                                [(DIM, DIM)]),
+  "cos":             (lambda a:    torch.cos(a),                                [(DIM, DIM)]),
+  "minimum":         (lambda a, b: torch.minimum(a, b),                         [(DIM, DIM), (DIM, DIM)]),
+  "scalar_add":      (lambda a:    a + 3.5,                                     [(DIM, DIM)]),
+  "scalar_mul":      (lambda a:    a * 0.25,                                    [(DIM, DIM)]),
+  "matmul_long_k":   (lambda a, b: a @ b,                                       [(64, 256), (256, 64)]),
+  "matmul_thin_m":   (lambda a, b: a @ b,                                       [(32, 128), (128, 64)]),
+  "sum_axis0":       (lambda a:    a.sum(dim=0),                                [(64, 64)], lambda r: r[0]),
+  "max_axis0":       (lambda a:    a.max(dim=0).values,                         [(64, 64)], lambda r: r[0]),
+  "sum_128":         (lambda a:    a.sum(dim=0),                                [(128, 128)], lambda r: r[0]),
+  "sum_256_64":      (lambda a:    a.sum(dim=0),                                [(256, 64)], lambda r: r[0]),
+  "sum_64_256":      (lambda a:    a.sum(dim=0),                                [(64, 256)], lambda r: r[0]),
+  "sum_axis1":       (lambda a:    a.sum(dim=1),                                [(64, 64)], lambda r: r[:, 0]),
+  "max_axis1":       (lambda a:    a.max(dim=1).values,                         [(64, 64)], lambda r: r[:, 0]),
+  "sum_ax1_long":    (lambda a:    a.sum(dim=1),                                [(64, 256)], lambda r: r[:, 0]),
+  "mean_axis0":      (lambda a:    a.mean(dim=0),                               [(64, 64)], lambda r: r[0]),
+  "mean_axis1":      (lambda a:    a.mean(dim=1),                               [(64, 64)], lambda r: r[:, 0]),
+  "min_axis0":       (lambda a:    a.min(dim=0).values,                         [(64, 64)], lambda r: r[0]),
+  "min_axis1":       (lambda a:    a.min(dim=1).values,                         [(64, 64)], lambda r: r[:, 0]),
+  "bcast_row":       (lambda a, b: a + b,                                       [(64, 64), (64, 1)]),
+  "bcast_col":       (lambda a, b: a + b,                                       [(64, 64), (1, 64)]),
+  "bcast_scalar":    (lambda a, b: a * b,                                       [(64, 64), (1, 1)]),
+  "fma":             (lambda a, b, c: a * b + c,                                [(64, 64), (64, 64), (64, 64)]),
+  "four_input":      (lambda a, b, c, d: a * b + c * d,                         [(64, 64), (64, 64), (64, 64), (64, 64)]),
+  "relu_48":         (lambda a:    torch.relu(a),                               [(48, 48)]),
+  "add_48":          (lambda a, b: a + b,                                       [(48, 48), (48, 48)]),
+  "matmul_48":       (lambda a, b: a @ b,                                       [(48, 48), (48, 48)]),
+  "sum_48_ax0":      (lambda a:    a.sum(dim=0),                                [(48, 48)], lambda r: r[0]),
+  "relu_50_70":      (lambda a:    torch.relu(a),                               [(50, 70)]),
+  "matmul_50_40_70": (lambda a, b: a @ b,                                       [(50, 40), (40, 70)]),
+  "sum_70_ax1":      (lambda a:    a.sum(dim=1),                                [(50, 70)], lambda r: r[:, 0]),
+  "sum_full":        (lambda a:    a.sum(),                                     [(64, 64)], lambda r: r[0, 0]),
+  "max_full":        (lambda a:    a.max(),                                     [(64, 64)], lambda r: r[0, 0]),
+  "mean_full":       (lambda a:    a.mean(),                                    [(64, 64)], lambda r: r[0, 0]),
+  "sum_full_128":    (lambda a:    a.sum(),                                     [(128, 128)], lambda r: r[0, 0]),
+  "sum_diff_full":   (lambda a, b: (a - b).sum(),                               [(64, 64), (64, 64)], lambda r: r[0, 0]),
+  "sub_max":         (lambda a:    a - a.max(dim=1, keepdim=True).values,       [(64, 64)]),
+  "softmax_manual":  (lambda a:    torch.softmax(a, dim=1),                     [(64, 64)]),
+  "softmax_native":  (lambda a:    torch.softmax(a, dim=1),                     [(64, 64)]),
+  "layernorm_manual":(lambda a:    (lambda c: c / torch.sqrt((c * c).mean(dim=1, keepdim=True) + 1e-5))(a - a.mean(dim=1, keepdim=True)),
+                                                                                [(64, 64)]),
+  "layernorm_native":(lambda a:    torch.nn.functional.layer_norm(a, (a.shape[-1],), eps=1e-5),
+                                                                                [(64, 64)]),
+  "layernorm_affine":(lambda x, w, b: torch.nn.functional.layer_norm(x, (x.shape[-1],), weight=w, bias=b, eps=1e-5),
+                                                                                [(64, 64), ROW64, ROW64]),
+  "softmax_ax0":     (lambda a: torch.softmax(a, dim=0),                        [(64, 64)]),
+  "var_ax1":         (lambda a: a.var(dim=1, keepdim=True, unbiased=False),     [(64, 64)]),
+  "std_ax1":         (lambda a: a.std(dim=1, keepdim=True, unbiased=False),     [(64, 64)]),
+  "matmul_bias":     (lambda a, b, c: a @ b + c,                                [(64, 64), (64, 64), ROW64]),
+  "matmul_t":        (lambda a, b: a @ b.T,                                     [(64, 64), (64, 64)]),
+  "matmul_ta":       (lambda a, b: a.T @ b,                                     [(64, 64), (64, 64)]),
+  "matmul_t_relu":   (lambda a, b: torch.relu(a @ b.T),                         [(64, 64), (64, 64)]),
+  "attn_qk":         (lambda q, k: torch.softmax((q @ k.T) * 0.125, dim=1),     [(64, 64), (64, 64)]),
+  "attn_full":       (lambda q, k, v: torch.softmax((q @ k.T) * 0.125, dim=1) @ v, [(64, 64), (64, 64), (64, 64)]),
+  "mul_relu_chain":  (lambda a, b: torch.relu((a + b) * 0.5),                   [(64, 64), (64, 64)]),
+  "matmul_t_128":    (lambda a, b: a @ b.T,                                     [(128, 128), (128, 128)]),
+  "attn_full_128":   (lambda q, k, v: torch.softmax((q @ k.T) * 0.03125, dim=1) @ v, [(128, 128), (128, 128), (128, 128)]),
+  "softmax_96":      (lambda a: torch.softmax(a, dim=1),                        [(96, 96)]),
+  "matmul_ta_rect":  (lambda a, b: a.T @ b,                                     [(64, 128), (64, 96)]),
+  "layernorm_96":    (lambda a: torch.nn.functional.layer_norm(a, (a.shape[-1],), eps=1e-5), [(96, 96)]),
+  "log_softmax":     (lambda a: torch.log_softmax(a, dim=1),                    [(64, 64)]),
+  "rms_norm":        (lambda x: x * torch.rsqrt((x*x).mean(dim=1, keepdim=True) + 1e-5), [(64, 64)]),
+  "softmax_after_matmul": (lambda a, b: torch.softmax((a @ b) * 0.125, dim=1), [(64, 64), (64, 64)]),
+  "swiglu":               (lambda a, b: torch.nn.functional.silu(a) * b,         [(64, 64), (64, 64)]),
+  "silu_mlp":             (lambda x, w1, w2: torch.nn.functional.silu(x @ w1) @ w2, [(64, 64), (64, 64), (64, 64)]),
+  "silu_after_matmul":    (lambda a, b: torch.nn.functional.silu((a @ b) * 0.015625), [(64, 64), (64, 64)]),
+  "gelu_after_matmul_split": (lambda a, b: torch.nn.functional.gelu((a @ b) * 0.015625, approximate="tanh"), [(64, 64), (64, 64)]),
+  "attn_masked":          (lambda q, k, m: torch.softmax((q @ k.T) * 0.125 + m, dim=1), [(64, 64), (64, 64), (64, 64)]),
+  "layernorm_128":        (lambda a: torch.nn.functional.layer_norm(a, (a.shape[-1],), eps=1e-5), [(128, 128)]),
+  "rms_norm_128":         (lambda x: x * torch.rsqrt((x*x).mean(dim=1, keepdim=True) + 1e-5), [(128, 128)]),
+  "swiglu_ffn":           (lambda x, w1, w2, w3: (torch.nn.functional.silu(x @ w1) * (x @ w2)) @ w3, [(64, 64), (64, 64), (64, 64), (64, 64)]),
+  "mlp_residual":         (lambda x, w1, w2: x + torch.relu(x @ w1) @ w2, [(64, 64), (64, 64), (64, 64)]),
+  "ln_residual":          (lambda x, h: torch.nn.functional.layer_norm(x + h, ((x+h).shape[-1],), eps=1e-5), [(64, 64), (64, 64)]),
+  "matmul_3way":          (lambda a, b, c: (a @ b) @ c, [(64, 64), (64, 64), (64, 64)]),
+  "rmsnorm_mlp_block":    (lambda x, w1, w2: x + torch.nn.functional.silu((x * torch.rsqrt((x*x).mean(dim=1, keepdim=True) + 1e-5)) @ w1) @ w2, [(64, 64), (64, 64), (64, 64)]),
+  "matmul_rect_128":      (lambda a, b: a @ b, [(128, 64), (64, 256)]),
+  "sigmoid_after_matmul": (lambda a, b: torch.sigmoid((a @ b) * 0.015625), [(64, 64), (64, 64)]),
+  "transformer_attn_block": (lambda q, k, v, x: x + torch.softmax((q @ k.T) * 0.125, dim=1) @ v, [(64, 64), (64, 64), (64, 64), (64, 64)]),
+  "softmax_128":          (lambda a: torch.softmax(a, dim=1), [(128, 128)]),
+  "mean_full_128":        (lambda a: a.mean(), [(128, 128)], lambda r: r[0, 0]),
+  "transformer_layer":    (lambda q, k, v, x, w1, w2: (lambda h: h + torch.nn.functional.silu((h * torch.rsqrt((h*h).mean(dim=1, keepdim=True) + 1e-5)) @ w1) @ w2)(x + torch.softmax((q @ k.T) * 0.125, dim=1) @ v), [(64, 64), (64, 64), (64, 64), (64, 64), (64, 64), (64, 64)]),
+  "transformer_layer_128":(lambda q, k, v, x, w1, w2: (lambda h: h + torch.nn.functional.silu((h * torch.rsqrt((h*h).mean(dim=1, keepdim=True) + 1e-5)) @ w1) @ w2)(x + torch.softmax((q @ k.T) * 0.088388, dim=1) @ v), [(128, 128), (128, 128), (128, 128), (128, 128), (128, 128), (128, 128)]),
+  "rmsnorm_mlp_128":      (lambda x, w1, w2: x + torch.nn.functional.silu((x * torch.rsqrt((x*x).mean(dim=1, keepdim=True) + 1e-5)) @ w1) @ w2, [(128, 128), (128, 128), (128, 128)]),
+  "gelu_glu_split":       (lambda a, b: torch.nn.functional.gelu(a, approximate="tanh") * b, [(64, 64), (64, 64)]),
+  "gelu_glu_fused":       (lambda a, b: torch.nn.functional.gelu(a, approximate="tanh") * b, [(64, 64), (64, 64)]),
+  "mlp_4x":               (lambda x, w1, w2: torch.nn.functional.silu(x @ w1) @ w2, [(64, 64), (64, 256), (256, 64)]),
+  "stacked_transformer":  (lambda q1, k1, v1, x, w1a, w1b, q2, k2, v2, w2a, w2b: (lambda h: h + torch.nn.functional.silu((h * torch.rsqrt((h*h).mean(dim=1, keepdim=True) + 1e-5)) @ w2a) @ w2b)((lambda layer1: layer1 + torch.softmax((q2 @ k2.T) * 0.125, dim=1) @ v2)((lambda h: h + torch.nn.functional.silu((h * torch.rsqrt((h*h).mean(dim=1, keepdim=True) + 1e-5)) @ w1a) @ w1b)(x + torch.softmax((q1 @ k1.T) * 0.125, dim=1) @ v1))), [(64, 64)] * 11),
+  "triple_transformer":   ((lambda layer: lambda q1, k1, v1, x, w1a, w1b, q2, k2, v2, w2a, w2b, q3, k3, v3, w3a, w3b: layer(layer(layer(x, q1, k1, v1, w1a, w1b), q2, k2, v2, w2a, w2b), q3, k3, v3, w3a, w3b))(lambda inp, q, k, v, wa, wb: (lambda h: h + torch.nn.functional.silu((h * torch.rsqrt((h*h).mean(dim=1, keepdim=True) + 1e-5)) @ wa) @ wb)(inp + torch.softmax((q @ k.T) * 0.125, dim=1) @ v)), [(64, 64)] * 16),
+  "silu_mlp_residual":    (lambda x, w1, w2: x + torch.nn.functional.silu(x @ w1) @ w2, [(64, 64), (64, 64), (64, 64)]),
+  "transformer_layer_4x": (lambda q, k, v, x, w1, w2: (lambda h: h + torch.nn.functional.silu((h * torch.rsqrt((h*h).mean(dim=1, keepdim=True) + 1e-5)) @ w1) @ w2)(x + torch.softmax((q @ k.T) * 0.125, dim=1) @ v), [(64, 64), (64, 64), (64, 64), (64, 64), (64, 256), (256, 64)]),
+  "quad_transformer":     ((lambda layer: lambda q1, k1, v1, x, w1a, w1b, q2, k2, v2, w2a, w2b, q3, k3, v3, w3a, w3b, q4, k4, v4, w4a, w4b: layer(layer(layer(layer(x, q1, k1, v1, w1a, w1b), q2, k2, v2, w2a, w2b), q3, k3, v3, w3a, w3b), q4, k4, v4, w4a, w4b))(lambda inp, q, k, v, wa, wb: (lambda h: h + torch.nn.functional.silu((h * torch.rsqrt((h*h).mean(dim=1, keepdim=True) + 1e-5)) @ wa) @ wb)(inp + torch.softmax((q @ k.T) * 0.125, dim=1) @ v)), [(64, 64)] * 21),
+  "transformer_layer_4x_128": (lambda q, k, v, x, w1, w2: (lambda h: h + torch.nn.functional.silu((h * torch.rsqrt((h*h).mean(dim=1, keepdim=True) + 1e-5)) @ w1) @ w2)(x + torch.softmax((q @ k.T) * 0.088388, dim=1) @ v), [(128, 128), (128, 128), (128, 128), (128, 128), (128, 512), (512, 128)]),
+  "cross_attention":      (lambda q, k, v: torch.softmax((q @ k.T) * 0.125, dim=1) @ v, [(64, 64), (96, 64), (96, 64)]),
+  "l2_norm_rows":         (lambda x: torch.sqrt((x * x).sum(dim=1)), [(64, 64)], lambda r: r[:, 0]),
+  "mish":                 (lambda x: x * torch.tanh(torch.log(1 + torch.exp(x))), [(64, 64)]),
+  "hardswish":            (lambda x: x * torch.clamp(x + 3, min=0, max=6) * (1/6), [(64, 64)]),
+  "positional_add":       (lambda x, p: x + p, [(64, 64), (64, 64)]),
+  "stacked_transformer_128": ((lambda layer: lambda q1, k1, v1, x, w1a, w1b, q2, k2, v2, w2a, w2b: layer(layer(x, q1, k1, v1, w1a, w1b), q2, k2, v2, w2a, w2b))(lambda inp, q, k, v, wa, wb: (lambda h: h + torch.nn.functional.silu((h * torch.rsqrt((h*h).mean(dim=1, keepdim=True) + 1e-5)) @ wa) @ wb)(inp + torch.softmax((q @ k.T) * 0.088388, dim=1) @ v)), [(128, 128)] * 11),
+  "cosine_sim_rows":      (lambda a, b: (a * b).sum(dim=1) / (torch.sqrt((a * a).sum(dim=1)) * torch.sqrt((b * b).sum(dim=1))), [(64, 64), (64, 64)], lambda r: r[:, 0]),
+  "geglu_ffn":            (lambda x, w1, w2, w3: (torch.nn.functional.gelu(x @ w1, approximate="tanh") * (x @ w2)) @ w3, [(64, 64)] * 4),
+  "matmul_32":            (lambda a, b: a @ b, [(32, 32), (32, 32)]),
+  "decoder_block":        (lambda qs, ks, vs, x, qc, ek, ev, w1, w2: (lambda h2: h2 + torch.nn.functional.silu((h2 * torch.rsqrt((h2*h2).mean(dim=1, keepdim=True) + 1e-5)) @ w1) @ w2)((lambda h1: h1 + torch.softmax((qc @ ek.T) * 0.125, dim=1) @ ev)(x + torch.softmax((qs @ ks.T) * 0.125, dim=1) @ vs)), [(64, 64)] * 9),
+  "mlp_block":       (lambda x, w1, w2: torch.relu(x @ w1) @ w2,                [(64, 64), (64, 64), (64, 64)]),
+}
